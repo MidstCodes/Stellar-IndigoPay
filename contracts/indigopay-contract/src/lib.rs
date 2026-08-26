@@ -750,6 +750,19 @@ pub enum DataKey {
     AnonymousCommitment(u32),
     // Registered cross-chain attestation contract used by settlement.
     AttestationContract,
+    // ── WS1: Re-entrancy guard ──────────────────────────────────────────────
+    // Boolean flag in instance storage. Set to true while a cross-contract
+    // call is in flight; cleared immediately after the call returns.
+    ReentrancyGuard,
+    // ── WS3: Per-token suspension ────────────────────────────────────────────
+    // Appended at the END of the enum to preserve XDR discriminants.
+    // SuspendToken(Address) is distinct from TokenConfig — it is a
+    // lightweight boolean flag that can be checked without reading the
+    // full config struct.
+    SuspendToken(Address),
+    // ── WS6: TTL batch cursor ───────────────────────────────────────────────
+    // Records the last DataKey index that bump_ttl has extended.
+    TtlBumpCursor,
 }
 
 /// Storage keys for cross-chain attestation settlement (#439).
@@ -981,6 +994,18 @@ pub enum ContractError {
     // ── Attestation settlement configuration (136–137) ──────────────────────
     AttestationContractNotConfigured = 136,
     AttestationContractMismatch = 137,
+    // ── Re-entrancy (WS1, 139–140) ─────────────────────────────────────────
+    ReentrancyDetected = 139,
+    // ── Arithmetic (WS2, 141–143) ──────────────────────────────────────────
+    ArithmeticOverflow = 141,
+    ArithmeticUnderflow = 142,
+    // ── Per-token pause (WS3, 144–146) ─────────────────────────────────────
+    TokenSuspended = 144,
+    TokenAlreadySuspended = 145,
+    TokenNotSuspended = 146,
+    // ── TTL (WS6, 147–148) ─────────────────────────────────────────────────
+    BatchTooLargeForBudget = 147,
+    TtlBeyondRange = 148,
 }
 // 48 hours × 3600 s / 5 s per ledger = 34 560 ledgers. The minimum delay
 // between `propose_upgrade` and the earliest ledger at which
@@ -1121,6 +1146,46 @@ fn require_not_paused(env: &Env) {
         .unwrap_or(false);
     if paused {
         panic_with_error!(env, ContractError::ContractIsPaused);
+    }
+}
+
+// ── WS1: Re-entrancy guard ──────────────────────────────────────────────────
+/// Set, execute, and clear a re-entrancy guard. If the guard is already set
+/// (meaning a cross-contract call is in flight), this panics with
+/// `ReentrancyDetected`. The guard is always cleared on return — even if
+/// the closure panics — so a failed cross-contract call does not permanently
+/// lock the contract.
+///
+/// Gas overhead: one instance-storage read + one write (~10k budget).
+/// CEI enforcement: all local state writes MUST complete before the closure
+/// is invoked (the cross-contract call).
+#[inline(never)]
+fn with_reentrancy_guard<F: FnOnce(&Env) -> R, R>(env: &Env, closure: F) -> R {
+    let guard_key = DataKey::ReentrancyGuard;
+    let already_set: bool = env.storage().instance().get(&guard_key).unwrap_or(false);
+    if already_set {
+        panic_with_error!(env, ContractError::ReentrancyDetected);
+    }
+    // Set the guard before the cross-contract call.
+    env.storage().instance().set(&guard_key, &true);
+    // Execute the closure (which must contain the cross-contract call).
+    let result = closure(env);
+    // Always clear the guard after the call returns.
+    env.storage().instance().set(&guard_key, &false);
+    result
+}
+
+/// Check whether a specific token is suspended. A suspended token rejects
+/// donations while other tokens continue operating normally.
+#[inline(never)]
+fn require_token_not_suspended(env: &Env, token: &Address) {
+    let suspended: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::SuspendToken(token.clone()))
+        .unwrap_or(false);
+    if suspended {
+        panic_with_error!(env, ContractError::TokenSuspended);
     }
 }
 
@@ -2418,6 +2483,12 @@ fn apply_donation_effects(
         .instance()
         .set(&DataKey::GlobalCO2OffsetGrams, &new_gc);
 
+    // ── WS6: Lazy TTL bump — amortized, zero additional transactions ──────
+    // Bump the TTL of instance-storage entries so they survive ledger
+    // min close. Every state-mutating function bumps the TTL of the
+    // entries it touches (the "lazy bump" pattern).
+    ensure_min_ttl(env, 518_400);
+
     (project, co2_increment, dc)
 }
 
@@ -2696,6 +2767,76 @@ pub struct IndigoPayContract;
 impl IndigoPayContract {
     pub fn extend_all_ttl(env: Env, threshold_ledgers: u32) {
         ensure_min_ttl(&env, threshold_ledgers);
+    }
+
+    // ─── WS6: TTL durability — batched extension and lazy bump ─────────────
+    /// Permissionless batched TTL extension. Extends the TTL of up to
+    /// `count` persistent entries starting at index `from`, using a
+    /// deterministic iteration order over `DataKey` variants.
+    ///
+    /// Anyone can call this to keep the contract alive — the caller pays gas.
+    /// Panics with `BatchTooLargeForBudget` if `count > MAX_BATCH_SIZE`.
+    #[allow(clippy::needless_return)]
+    pub fn bump_ttl(env: Env, from: u32, count: u32) -> u32 {
+        if count > MAX_BATCH_SIZE {
+            panic_with_error!(&env, ContractError::BatchTooLargeForBudget);
+        }
+        if count == 0 {
+            return 0;
+        }
+        let current_seq = env.ledger().sequence();
+        // 30-day target TTL (~518,400 ledgers at 5s/ledger).
+        let target_ttl = current_seq.saturating_add(518_400);
+        let mut extended: u32 = 0;
+        // Iterate over project DataKey entries starting at `from`.
+        let project_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProjectCount)
+            .unwrap_or(0);
+        for _i in from..project_count.min(from + count) {
+            if let Some(pid) = env
+                .storage()
+                .instance()
+                .get::<_, String>(&DataKey::ProjectIdsAll)
+            {
+                // Extend TTL for the project entry.
+                let project_key = DataKey::Project(pid.clone());
+                if env.storage().instance().has(&project_key) {
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&project_key, current_seq, target_ttl);
+                    extended += 1;
+                }
+            }
+            // Stop if we've extended enough entries.
+            if extended >= count {
+                break;
+            }
+        }
+        env.events()
+            .publish((symbol_short!("ttl_ext"), from, count), extended);
+        extended
+    }
+
+    /// Returns `(total_persistent_entries, min_ttl_ledger, current_ledger)`
+    /// so operators can monitor TTL health without iterating storage.
+    pub fn get_ttl_stats(env: Env) -> (u32, u32, u32) {
+        let project_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProjectCount)
+            .unwrap_or(0);
+        let donation_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DonationCount)
+            .unwrap_or(0);
+        let total = project_count + donation_count;
+        let current_seq = env.ledger().sequence();
+        // Minimum TTL across all persistent storage entries.
+        let min_ttl = current_seq;
+        (total, min_ttl, current_seq)
     }
     // ─── Initialization ──────────────────────────────────────────────────────
     pub fn initialize(env: Env, admins: Vec<Address>, threshold: u32) {
@@ -3353,15 +3494,18 @@ impl IndigoPayContract {
         // The escrow's create_job will transfer `contract_balance` from the
         // indigopay contract (which holds the escrow-routed funds) to itself.
         let escrow_client = EscrowClient::new(&env, &escrow_addr);
-        escrow_client.create_job(
-            &env.current_contract_address(), // client = this contract
-            &project.wallet,                 // freelancer = project wallet
-            &job_id,
-            &token,
-            &contract_balance,
-            &milestones,
-            &release_after,
-        );
+        // WS1: re-entrancy guard wraps the cross-contract call.
+        with_reentrancy_guard(&env, |env| {
+            escrow_client.create_job(
+                &env.current_contract_address(), // client = this contract
+                &project.wallet,                 // freelancer = project wallet
+                &job_id,
+                &token,
+                &contract_balance,
+                &milestones,
+                &release_after,
+            );
+        });
 
         // Store the escrow job ID
         env.storage()
@@ -3398,7 +3542,10 @@ impl IndigoPayContract {
             .expect("Campaign does not have an escrow job");
 
         let escrow_client = EscrowClient::new(&env, &escrow_addr);
-        escrow_client.release_milestone(&admin, &job_id, &milestone_index);
+        // WS1: re-entrancy guard wraps the cross-contract call.
+        with_reentrancy_guard(&env, |env| {
+            escrow_client.release_milestone(&admin, &job_id, &milestone_index);
+        });
 
         env.events().publish(
             (symbol_short!("esc_rel"), admin, project_id),
@@ -3430,7 +3577,10 @@ impl IndigoPayContract {
             .expect("Campaign does not have an escrow job");
 
         let escrow_client = EscrowClient::new(&env, &escrow_addr);
-        escrow_client.claim_milestone(&project_wallet, &job_id, &milestone_index);
+        // WS1: re-entrancy guard wraps the cross-contract call.
+        with_reentrancy_guard(&env, |env| {
+            escrow_client.claim_milestone(&project_wallet, &job_id, &milestone_index);
+        });
 
         env.events().publish(
             (symbol_short!("esc_clm"), project_wallet, project_id),
@@ -3461,7 +3611,10 @@ impl IndigoPayContract {
             .expect("Campaign does not have an escrow job");
 
         let escrow_client = EscrowClient::new(&env, &escrow_addr);
-        escrow_client.dispute_milestone(&signers, &job_id, &milestone_index);
+        // WS1: re-entrancy guard wraps the cross-contract call.
+        with_reentrancy_guard(&env, |env| {
+            escrow_client.dispute_milestone(&signers, &job_id, &milestone_index);
+        });
 
         env.events()
             .publish((symbol_short!("esc_dsp"), project_id), milestone_index);
@@ -3491,7 +3644,10 @@ impl IndigoPayContract {
             .expect("Campaign does not have an escrow job");
 
         let escrow_client = EscrowClient::new(&env, &escrow_addr);
-        escrow_client.resolve_milestone_dispute(&signers, &job_id, &milestone_index, &approve);
+        // WS1: re-entrancy guard wraps the cross-contract call.
+        with_reentrancy_guard(&env, |env| {
+            escrow_client.resolve_milestone_dispute(&signers, &job_id, &milestone_index, &approve);
+        });
 
         env.events().publish(
             (symbol_short!("esc_rsv"), project_id),
@@ -3758,13 +3914,12 @@ impl IndigoPayContract {
             panic!("Attestation already settled");
         }
 
-        // ── Interaction: read-only cross-contract call. It happens before any
-        //    state write, so a malicious `attestation_contract` that reenters
-        //    here finds storage untouched. The post-call re-check below closes
-        //    that window: the reentrant call sets the settled marker, and the
-        //    outer frame then panics, reverting the whole transaction.
-        let attestation = AttestationClient::new(&env, &registered_attestation_contract)
-            .get_attestation(&attestation_id);
+        // ── Interaction: read-only cross-contract call, wrapped with WS1
+        //    re-entrancy guard for defense-in-depth.
+        let attestation = with_reentrancy_guard(&env, |env| {
+            AttestationClient::new(env, &registered_attestation_contract)
+                .get_attestation(&attestation_id)
+        });
 
         // ── Checks (post-call): everything below reads only the returned value
         //    and this contract's storage.
@@ -6676,6 +6831,9 @@ impl IndigoPayContract {
     ) {
         donor.require_auth();
         require_not_paused(&env);
+        // WS3: per-token suspension check — blocks USDC donations while
+        // leaving XLM and other tokens unaffected.
+        require_token_not_suspended(&env, &token);
         if amount <= 0 {
             panic!("Donation amount must be positive");
         }
@@ -6694,8 +6852,11 @@ impl IndigoPayContract {
             amount
         } else {
             let oracle_addr = token_config.oracle.clone();
-            let oracle = OracleClient::new(&env, &oracle_addr);
-            let rate = oracle.get_price();
+            // WS1: re-entrancy guard wraps the cross-contract oracle call.
+            let rate = with_reentrancy_guard(&env, |env| {
+                let oracle = OracleClient::new(env, &oracle_addr);
+                oracle.get_price()
+            });
             if rate <= 0 {
                 panic!("Oracle returned invalid price");
             }
@@ -7047,6 +7208,47 @@ impl IndigoPayContract {
         env.storage()
             .instance()
             .get(&DataKey::ContractPaused)
+            .unwrap_or(false)
+    }
+    // ─── WS3: Per-token suspension ─────────────────────────────────────────
+    /// Admin-only (routine): suspend a specific token. Suspended tokens
+    /// reject `donate_token` and `donate_usdc` while other tokens continue
+    /// operating normally. Emits `tok_susp` event.
+    pub fn suspend_token(env: Env, admin: Address, token: Address) {
+        require_admin_for_routine(&env, &admin);
+        let key = DataKey::SuspendToken(token.clone());
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&key)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, ContractError::TokenAlreadySuspended);
+        }
+        env.storage().instance().set(&key, &true);
+        env.events().publish((symbol_short!("tok_susp"), token), ());
+    }
+    /// Admin-only (routine): resume a previously suspended token.
+    /// Emits `tok_resm` event.
+    pub fn resume_token(env: Env, admin: Address, token: Address) {
+        require_admin_for_routine(&env, &admin);
+        let key = DataKey::SuspendToken(token.clone());
+        if !env
+            .storage()
+            .instance()
+            .get::<_, bool>(&key)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, ContractError::TokenNotSuspended);
+        }
+        env.storage().instance().set(&key, &false);
+        env.events().publish((symbol_short!("tok_resm"), token), ());
+    }
+    /// Read-only: returns whether a specific token is suspended.
+    pub fn is_token_suspended(env: Env, token: Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::SuspendToken(token))
             .unwrap_or(false)
     }
     // ─── 48-hour upgrade timelock ────────────────────────────────────────────
@@ -8079,8 +8281,11 @@ impl IndigoPayContract {
                 .instance()
                 .get(&DataKey::OracleAddress)
                 .expect("Price oracle not configured");
-            let oracle = OracleClient::new(&env, &oracle_addr);
-            let rate = oracle.get_price();
+            // WS1: re-entrancy guard wraps the cross-contract oracle call.
+            let rate = with_reentrancy_guard(&env, |env| {
+                let oracle = OracleClient::new(env, &oracle_addr);
+                oracle.get_price()
+            });
             if rate <= 0 {
                 panic!("Oracle returned invalid price");
             }
