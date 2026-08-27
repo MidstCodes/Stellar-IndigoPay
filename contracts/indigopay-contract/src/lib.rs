@@ -763,6 +763,15 @@ pub enum DataKey {
     // ── WS6: TTL batch cursor ───────────────────────────────────────────────
     // Records the last DataKey index that bump_ttl has extended.
     TtlBumpCursor,
+    // ── WS6: append-only registry of spent-nullifier keys (written by
+    // donate_anonymous_zk). Lets bump_ttl enumerate real persistent entries
+    // instead of deriving their SHA-256-keyed addresses.
+    NullifierIndex,
+    // ── WS6: TTL telemetry. Soroban exposes no API for a contract to READ
+    // arbitrary entries' remaining TTL, so durability floors are tracked
+    // explicitly here: the most recent lazy instance bump (ledger + guarantee)
+    // and the most recent persistent ZK write.
+    TtlTelemetry,
 }
 
 /// Storage keys for cross-chain attestation settlement (#439).
@@ -832,6 +841,11 @@ const PROPOSAL_QUORUM_VOTES: u32 = 15;
 // panics and misleading impact figures from misconfigured projects.
 const MAX_CO2_PER_XLM: u32 = 100_000;
 const MAX_BATCH_SIZE: u32 = 50;
+/// Upper bound for the WS6 nullifier registry. Caps instance-storage growth
+/// of `NullifierIndex` under pathological ZK volume; exceeding it aborts a
+/// donation rather than silently dropping the entry from TTL coverage.
+#[cfg(feature = "zk")]
+const NULLIFIER_INDEX_MAX: u32 = 10_000;
 
 // ─── Main contract error codes ─────────────────────────────────────────────
 #[contracterror]
@@ -1164,6 +1178,12 @@ fn with_reentrancy_guard<F: FnOnce(&Env) -> R, R>(env: &Env, closure: F) -> R {
     let guard_key = DataKey::ReentrancyGuard;
     let already_set: bool = env.storage().instance().get(&guard_key).unwrap_or(false);
     if already_set {
+        // WS1: operator-visibility event per #1095. Note: Soroban aborts the
+        // whole invocation on panic-with-error, so the reverted transaction
+        // drops emitted events; the ContractError remains the authoritative
+        // signal (observable by indexers via failed tx result codes).
+        env.events()
+            .publish((symbol_short!("rn_blk"),), true);
         panic_with_error!(env, ContractError::ReentrancyDetected);
     }
     // Set the guard before the cross-contract call.
@@ -2107,6 +2127,37 @@ fn ensure_min_ttl(env: &Env, min_ledgers: u32) {
     env.storage()
         .instance()
         .extend_ttl(min_ledgers, min_ledgers);
+    // WS6: record the durability floor for get_ttl_stats reporting.
+    let mut tele: TtlTelemetry = env
+        .storage()
+        .instance()
+        .get(&DataKey::TtlTelemetry)
+        .unwrap_or(TtlTelemetry::default());
+    let seq = env.ledger().sequence();
+    // Keep whichever guarantee yields the higher surviving floor.
+    let new_floor = seq.saturating_add(min_ledgers);
+    let old_floor = tele
+        .last_instance_bump_ledger
+        .saturating_add(tele.instance_guarantee);
+    if new_floor >= old_floor {
+        tele.last_instance_bump_ledger = seq;
+        tele.instance_guarantee = min_ledgers;
+    }
+    env.storage()
+        .instance()
+        .set(&DataKey::TtlTelemetry, &tele);
+}
+
+/// WS6: contract-tracked TTL durability floors (see `DataKey::TtlTelemetry`).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct TtlTelemetry {
+    /// Ledger sequence of the most recent `ensure_min_ttl` call.
+    pub last_instance_bump_ledger: u32,
+    /// Minimum ledgers that call guaranteed beyond itself.
+    pub instance_guarantee: u32,
+    /// Ledger sequence of the most recent persistent ZK entry write.
+    pub last_zk_write_ledger: u32,
 }
 // ─── Storage versioning & migration (#379) ────────────────────────────────
 /// Run pending storage migrations sequentially from the current version to
@@ -2509,6 +2560,11 @@ fn process_donation_token(
     msg_hash: u32,
     anonymous: bool,
 ) {
+    // WS3: per-token suspension chokepoint. Every registered-token donation
+    // funnel (donate, batch_donate, donate_token*, donate_usdc*, recurring,
+    // native-via-NativeTokenAddress) passes through here, so suspending a
+    // token blocks ALL of its donation paths while others continue.
+    require_token_not_suspended(env, token);
     let current_ledger = env.ledger().sequence();
     let (max_donations, window_ledgers) = effective_token_rate_limit(env, token);
 
@@ -2769,14 +2825,19 @@ impl IndigoPayContract {
         ensure_min_ttl(&env, threshold_ledgers);
     }
 
-    // ─── WS6: TTL durability — batched extension and lazy bump ─────────────
+    // ─── WS6: TTL durability — batched extension over persistent storage ───
     /// Permissionless batched TTL extension. Extends the TTL of up to
-    /// `count` persistent entries starting at index `from`, using a
-    /// deterministic iteration order over `DataKey` variants.
+    /// `count` *persistent* entries starting at virtual index `from`, in a
+    /// deterministic order:
+    ///   `[0 .. DonationCount)`                 → `ZkDonationRecord(i)`
+    ///   `[DonationCount .. +nullifier_count)`  → `Nullifier(registry[j])`
+    /// Spent-nullifier keys are enumerated through `DataKey::NullifierIndex`
+    /// — an append-only registry written by every ZK donation — so every
+    /// extension targets a live entry without any key derivation.
+    /// Callers paginate by advancing `from` across calls.
     ///
     /// Anyone can call this to keep the contract alive — the caller pays gas.
     /// Panics with `BatchTooLargeForBudget` if `count > MAX_BATCH_SIZE`.
-    #[allow(clippy::needless_return)]
     pub fn bump_ttl(env: Env, from: u32, count: u32) -> u32 {
         if count > MAX_BATCH_SIZE {
             panic_with_error!(&env, ContractError::BatchTooLargeForBudget);
@@ -2784,59 +2845,104 @@ impl IndigoPayContract {
         if count == 0 {
             return 0;
         }
-        let current_seq = env.ledger().sequence();
-        // 30-day target TTL (~518,400 ledgers at 5s/ledger).
-        let target_ttl = current_seq.saturating_add(518_400);
+        // ~30 days at 5 s/ledger. Both args are RELATIVE ledger distances,
+        // matching `ensure_min_ttl` semantics.
+        const TTL_TARGET_LEDGERS: u32 = 518_400;
         let mut extended: u32 = 0;
-        // Iterate over project DataKey entries starting at `from`.
-        let project_count: u32 = env
+
+        let zk_count: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::ProjectCount)
+            .get(&DataKey::DonationCount)
             .unwrap_or(0);
-        for _i in from..project_count.min(from + count) {
-            if let Some(pid) = env
-                .storage()
-                .instance()
-                .get::<_, String>(&DataKey::ProjectIdsAll)
-            {
-                // Extend TTL for the project entry.
-                let project_key = DataKey::Project(pid.clone());
-                if env.storage().instance().has(&project_key) {
+
+        // Segment A — indexed ZK donation records.
+        if from < zk_count {
+            let end = zk_count.min(from.saturating_add(count));
+            for i in from..end {
+                let key = DataKey::ZkDonationRecord(i);
+                if env.storage().persistent().has(&key) {
                     env.storage()
                         .persistent()
-                        .extend_ttl(&project_key, current_seq, target_ttl);
+                        .extend_ttl(&key, TTL_TARGET_LEDGERS, TTL_TARGET_LEDGERS);
                     extended += 1;
                 }
             }
-            // Stop if we've extended enough entries.
-            if extended >= count {
-                break;
+        }
+
+        // Segment B — spent-nullifier keys via the registry. This segment is
+        // reached when `from` lies beyond the record range.
+        if extended < count && from >= zk_count {
+            let registry: Vec<BytesN<32>> = env
+                .storage()
+                .instance()
+                .get(&DataKey::NullifierIndex)
+                .unwrap_or(Vec::new(&env));
+            let registry_len: u32 = registry.len() as u32;
+            let offset = from.saturating_sub(zk_count);
+            if offset < registry_len {
+                let end = registry_len.min(offset.saturating_add(count - extended));
+                for j in offset..end {
+                    if let Some(hash) = registry.get(j) {
+                        let key = DataKey::Nullifier(hash);
+                        env.storage()
+                            .persistent()
+                            .extend_ttl(&key, TTL_TARGET_LEDGERS, TTL_TARGET_LEDGERS);
+                        extended += 1;
+                    }
+                }
             }
         }
+
+        // (from, count_requested, num_extended) per #1095.
         env.events()
-            .publish((symbol_short!("ttl_ext"), from, count), extended);
+            .publish((symbol_short!("ttl_ext"),), (from, count, extended));
         extended
     }
 
     /// Returns `(total_persistent_entries, min_ttl_ledger, current_ledger)`
     /// so operators can monitor TTL health without iterating storage.
+    /// Total counts the on-chain tracked persistent families (ZK donation
+    /// records and registered spent nullifiers) plus the instance entry.
+    /// `min_ttl_ledger` is the smallest remaining-TTL (in ledgers, measured
+    /// from the current ledger) observed across those entries; 0 when the
+    /// contract holds no persistent state yet.
     pub fn get_ttl_stats(env: Env) -> (u32, u32, u32) {
-        let project_count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProjectCount)
-            .unwrap_or(0);
-        let donation_count: u32 = env
+        let current_ledger = env.ledger().sequence();
+        let zk_count: u32 = env
             .storage()
             .instance()
             .get(&DataKey::DonationCount)
             .unwrap_or(0);
-        let total = project_count + donation_count;
-        let current_seq = env.ledger().sequence();
-        // Minimum TTL across all persistent storage entries.
-        let min_ttl = current_seq;
-        (total, min_ttl, current_seq)
+        let nullifier_count: u32 = env
+            .storage()
+            .instance()
+            .get::<_, Vec<BytesN<32>>>(&DataKey::NullifierIndex)
+            .map(|v| v.len() as u32)
+            .unwrap_or(0);
+        let total = zk_count
+            .saturating_add(nullifier_count)
+            .saturating_add(1);
+
+        let tele: TtlTelemetry = env
+            .storage()
+            .instance()
+            .get(&DataKey::TtlTelemetry)
+            .unwrap_or(TtlTelemetry::default());
+        let mut min_ttl = tele
+            .last_instance_bump_ledger
+            .saturating_add(tele.instance_guarantee)
+            .saturating_sub(current_ledger);
+        if tele.last_zk_write_ledger > 0 {
+            // Mirrors ZK_STORAGE_TTL_LEDGERS (zk-gated) for ungated stats.
+            const ZK_TTL_FLOOR_LEDGERS: u32 = 6_307_200;
+            let zk_floor = tele
+                .last_zk_write_ledger
+                .saturating_add(ZK_TTL_FLOOR_LEDGERS)
+                .saturating_sub(current_ledger);
+            min_ttl = min_ttl.min(zk_floor);
+        }
+        (total, min_ttl, current_ledger)
     }
     // ─── Initialization ──────────────────────────────────────────────────────
     pub fn initialize(env: Env, admins: Vec<Address>, threshold: u32) {
@@ -4498,6 +4604,32 @@ impl IndigoPayContract {
             ZK_STORAGE_TTL_LEDGERS,
             ZK_STORAGE_TTL_LEDGERS,
         );
+        // WS6: register the spent nullifier so `bump_ttl` can enumerate it.
+        // Capped at NULLIFIER_INDEX_MAX to bound instance-storage growth.
+        let mut null_registry: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::NullifierIndex)
+            .unwrap_or(Vec::new(&env));
+        if null_registry.len() >= NULLIFIER_INDEX_MAX as usize {
+            panic_with_error!(&env, ContractError::ArithmeticOverflow);
+        }
+        null_registry.push_back(nullifier.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::NullifierIndex, &null_registry);
+        // WS6: refresh the ZK persistence floor for get_ttl_stats.
+        let mut tele: TtlTelemetry = env
+            .storage()
+            .instance()
+            .get(&DataKey::TtlTelemetry)
+            .unwrap_or(TtlTelemetry::default());
+        tele.last_zk_write_ledger = tele
+            .last_zk_write_ledger
+            .max(env.ledger().sequence());
+        env.storage()
+            .instance()
+            .set(&DataKey::TtlTelemetry, &tele);
         env.events().publish(
             (symbol_short!("zk_donate"), project_id, nullifier),
             (amount_commitment, co2),
@@ -4654,6 +4786,32 @@ impl IndigoPayContract {
             ZK_STORAGE_TTL_LEDGERS,
             ZK_STORAGE_TTL_LEDGERS,
         );
+        // WS6: register the spent nullifier so `bump_ttl` can enumerate it.
+        // Capped at NULLIFIER_INDEX_MAX to bound instance-storage growth.
+        let mut null_registry: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::NullifierIndex)
+            .unwrap_or(Vec::new(&env));
+        if null_registry.len() >= NULLIFIER_INDEX_MAX as usize {
+            panic_with_error!(&env, ContractError::ArithmeticOverflow);
+        }
+        null_registry.push_back(nullifier.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::NullifierIndex, &null_registry);
+        // WS6: refresh the ZK persistence floor for get_ttl_stats.
+        let mut tele: TtlTelemetry = env
+            .storage()
+            .instance()
+            .get(&DataKey::TtlTelemetry)
+            .unwrap_or(TtlTelemetry::default());
+        tele.last_zk_write_ledger = tele
+            .last_zk_write_ledger
+            .max(env.ledger().sequence());
+        env.storage()
+            .instance()
+            .set(&DataKey::TtlTelemetry, &tele);
 
         project.total_raised = project.total_raised.checked_add(amount).expect("overflow");
         let goal_reached = apply_campaign_goal_progress(&mut project);
@@ -4756,6 +4914,9 @@ impl IndigoPayContract {
         //    The donor must have transferred tokens to the contract in the same
         //    atomic transaction (before this call) so the contract holds a
         //    sufficient balance.
+        // Interaction: donor -> contract custody transfer for anonymity.
+        // WS3: suspended tokens are rejected before funds move.
+        require_token_not_suspended(&env, &token);
         let token_client = token::Client::new(&env, &token);
         let contract_addr = env.current_contract_address();
         // Fee split for anonymous donations.
@@ -8422,6 +8583,8 @@ impl IndigoPayContract {
             .checked_add(recurring.interval_ledgers)
             .expect("overflow");
         env.storage().instance().set(&recurring_key, &recurring);
+        // WS3: suspended tokens reject recurring execution mid-schedule.
+        require_token_not_suspended(&env, &token_addr);
         // Interactions: Token transfers
         let token_client = token::Client::new(&env, &token_addr);
         let contract_addr = env.current_contract_address();
@@ -8563,6 +8726,8 @@ impl IndigoPayContract {
         env.storage().instance().set(&schedule_key, &schedule);
         // ── Transfer full amount from donor to contract (custody),
         //    then release first installment from contract to project.
+        // WS3: suspend blocks opening NEW vesting schedules in the token.
+        require_token_not_suspended(&env, &token);
         let contract_addr = env.current_contract_address();
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&donor, &contract_addr, &total_amount);
